@@ -1,0 +1,179 @@
+:root {
+  --bg: #0b0c0f;
+  --surface: #14161c;
+  --text: #e8eaef;
+  --muted: #8b92a5;
+  --accent: #ff3b4a;
+  --ring: rgba(255, 255, 255, 0.12);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, sans-serif;
+}
+
+body {
+  min-height: 100dvh;
+}
+
+.app {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: env(safe-area-inset-top) 16px calc(24px + env(safe-area-inset-bottom));
+}
+
+.top {
+  width: 100%;
+  max-width: 480px;
+  text-align: center;
+  padding-top: 8px;
+}
+
+.hint {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.stage {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  gap: 16px;
+}
+
+.circle-frame {
+  width: min(72vmin, 360px);
+  height: min(72vmin, 360px);
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow:
+    0 0 0 1px var(--ring),
+    0 24px 80px rgba(0, 0, 0, 0.55);
+  position: relative;
+}
+
+.circle-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transform: scaleX(var(--mirror, 1));
+}
+
+.status {
+  margin: 0;
+  min-height: 1.25em;
+  font-size: 0.95rem;
+  color: var(--muted);
+  text-align: center;
+  max-width: 320px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 40px;
+  padding: 8px 0 0;
+  width: 100%;
+  max-width: 420px;
+}
+
+.btn-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: 1px solid var(--ring);
+  background: var(--surface);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.btn-icon:hover {
+  background: #1a1d26;
+}
+
+.btn-icon:active {
+  transform: scale(0.96);
+}
+
+.btn-icon:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.btn-record {
+  width: 88px;
+  height: 88px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  background: radial-gradient(circle at 30% 25%, #2a2f3a, #12141a);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  transition: transform 0.12s ease, box-shadow 0.2s ease;
+}
+
+.btn-record:hover:not(:disabled) {
+  transform: scale(1.03);
+}
+
+.btn-record:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn-record:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.btn-record-inner {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 6px rgba(255, 59, 74, 0.25);
+  transition: border-radius 0.2s ease, transform 0.2s ease, background 0.2s ease;
+}
+
+.btn-record.recording .btn-record-inner {
+  border-radius: 8px;
+  width: 32px;
+  height: 32px;
+  background: #ff5a68;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 6px rgba(255, 59, 74, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 0 12px rgba(255, 59, 74, 0.12);
+  }
+}

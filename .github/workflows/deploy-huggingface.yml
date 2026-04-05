@@ -1,0 +1,41 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "Add repository secret HF_TOKEN (Hugging Face access token with write access to the Space)."
+            exit 1
+          fi
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git clone --depth 1 "https://Matveykovich:${HF_TOKEN}@huggingface.co/spaces/Matveykovich/kruzhcl.git" hf-space
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='hf-space' \
+            --exclude='.github' \
+            ./ hf-space/
+          cd hf-space
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Deploy ${GITHUB_SHA:0:7}"
+            git push origin HEAD:main
+          fi
