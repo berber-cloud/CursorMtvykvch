@@ -38,6 +38,8 @@ Space: [huggingface.co/spaces/Matveykovich/Kruzchl](https://huggingface.co/space
 
 Файлы появятся в ветке `main` в каталоге `kruzhki/`; рядом — файлы `*.owner` с id сессии.
 
+Если кружки лежат не на ветке `main`, задайте **Variable** `HF_KRUZHKI_REVISION` (имя ветки, например `main`).
+
 Если `HF_KRUZHKI_REPO` **не** задан, кружки пишутся только в локальную папку `videos/` на диске Space.
 
 #### «Нет просмотров» после записи

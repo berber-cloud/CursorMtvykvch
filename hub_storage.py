@@ -17,6 +17,11 @@ from huggingface_hub import HfApi, hf_hub_download
 PREFIX = "kruzhki"
 
 
+def _hub_revision() -> str | None:
+    r = os.environ.get("HF_KRUZHKI_REVISION", "").strip()
+    return r or None
+
+
 def _repo() -> str:
     return os.environ.get("HF_KRUZHKI_REPO", "").strip()
 
@@ -46,35 +51,82 @@ def save_video(body: bytes, ext: str, owner_sid: str) -> str:
     rel_video = f"{PREFIX}/{name}"
     rel_owner = f"{PREFIX}/{name}.owner"
 
+    up_kw: dict = {"repo_id": repo, "repo_type": "dataset"}
+    rev = _hub_revision()
+    if rev:
+        up_kw["revision"] = rev
+
     api.upload_file(
         path_or_fileobj=io.BytesIO(body),
         path_in_repo=rel_video,
-        repo_id=repo,
-        repo_type="dataset",
         commit_message=f"kruzchl video {name}",
+        **up_kw,
     )
     api.upload_file(
         path_or_fileobj=io.BytesIO(owner_sid.encode("utf-8")),
         path_in_repo=rel_owner,
-        repo_id=repo,
-        repo_type="dataset",
         commit_message=f"kruzchl owner {name}",
+        **up_kw,
     )
     return name
+
+
+def _normalize_hub_path(item) -> str:
+    p = str(getattr(item, "path", item)).replace("\\", "/").strip()
+    if p.startswith("/"):
+        p = p[1:]
+    return p
+
+
+def _list_kruzhki_video_paths(api: HfApi, repo: str) -> list[str]:
+    """
+    Полный список файлов в dataset, затем фильтр по префиксу kruzhki/.
+    list_repo_files(..., path_in_repo=...) на Hub часто даёт пустой список — из‑за этого
+    «нет чужих кружков» при заполненном репозитории.
+    """
+    rev = _hub_revision()
+    kw: dict = {"repo_id": repo, "repo_type": "dataset"}
+    if rev:
+        kw["revision"] = rev
+    try:
+        raw = api.list_repo_files(**kw)
+    except Exception:
+        return []
+
+    prefix = f"{PREFIX}/"
+    videos: list[str] = []
+    for item in raw:
+        p = _normalize_hub_path(item)
+        low = p.lower()
+        if not low.startswith(prefix.lower()):
+            continue
+        if low.endswith(".owner"):
+            continue
+        if low.endswith(".webm") or low.endswith(".mp4"):
+            videos.append(p)
+    return videos
 
 
 def _owner_for_video(api: HfApi, repo: str, video_rel_path: str) -> str | None:
     owner_rel = f"{video_rel_path}.owner"
     try:
-        p = hf_hub_download(
-            repo_id=repo,
-            filename=owner_rel,
-            repo_type="dataset",
-            token=_token(),
-        )
+        kw = {
+            "repo_id": repo,
+            "filename": owner_rel,
+            "repo_type": "dataset",
+            "token": _token(),
+        }
+        r = _hub_revision()
+        if r:
+            kw["revision"] = r
+        p = hf_hub_download(**kw)
         return Path(p).read_text(encoding="utf-8").strip()
     except Exception:
         return None
+
+
+def _sid_match(a: str | None, b: str | None) -> bool:
+    return (a or "").strip().lower() == (b or "").strip().lower()
 
 
 def pick_random_video(exclude_owner_sid: str) -> tuple[str, str] | None:
@@ -83,32 +135,15 @@ def pick_random_video(exclude_owner_sid: str) -> tuple[str, str] | None:
     """
     repo = _repo()
     api = _api()
-    try:
-        raw = api.list_repo_files(
-            repo_id=repo,
-            repo_type="dataset",
-            path_in_repo=PREFIX,
-        )
-    except Exception:
+    videos = _list_kruzhki_video_paths(api, repo)
+    if not videos:
         return None
 
-    paths = []
-    for item in raw:
-        p = str(getattr(item, "path", item)).replace("\\", "/")
-        if not p.startswith(f"{PREFIX}/"):
-            p = f"{PREFIX}/{p.lstrip('/')}"
-        paths.append(p)
-
-    videos = [
-        p
-        for p in paths
-        if (p.endswith(".webm") or p.endswith(".mp4")) and not p.endswith(".owner")
-    ]
     random.shuffle(videos)
 
     for rel in videos:
         owner = _owner_for_video(api, repo, rel)
-        if owner is None or owner != exclude_owner_sid:
+        if owner is None or not _sid_match(owner, exclude_owner_sid):
             return rel, Path(rel).name
 
     return None
@@ -117,11 +152,13 @@ def pick_random_video(exclude_owner_sid: str) -> tuple[str, str] | None:
 def local_path_for_playback(rel_path: str) -> Path:
     """Download (cached) file from Hub; returns local path for FileResponse."""
     safe = rel_path.lstrip("/").replace("..", "")
-    return Path(
-        hf_hub_download(
-            repo_id=_repo(),
-            filename=safe,
-            repo_type="dataset",
-            token=_token(),
-        )
-    )
+    kw = {
+        "repo_id": _repo(),
+        "filename": safe,
+        "repo_type": "dataset",
+        "token": _token(),
+    }
+    r = _hub_revision()
+    if r:
+        kw["revision"] = r
+    return Path(hf_hub_download(**kw))
