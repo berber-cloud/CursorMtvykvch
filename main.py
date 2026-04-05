@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import Lock
 from urllib.parse import quote, unquote
 
-from fastapi import Cookie, FastAPI, File, HTTPException, Query, Response, UploadFile
+from fastapi import Cookie, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -27,22 +27,39 @@ VIEWS_PER_UPLOAD = 5
 _store_lock = Lock()
 
 
-def _set_session_cookie(response: Response, sid: str) -> None:
+def _cookie_secure(request: Request) -> bool:
+    """
+    HF и другие прокси часто отдают приложению HTTP, а снаружи HTTPS.
+    Secure-cookie при этом должна включаться по X-Forwarded-Proto, иначе браузер
+    не сохранит сессию и квота «сбрасывается» (нет просмотров после записи).
+    """
+    force = os.environ.get("KRUZHCL_SECURE_COOKIES", "").lower()
+    if force in ("1", "true", "yes"):
+        return True
+    if force in ("0", "false", "no"):
+        return False
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if forwarded == "https":
+        return True
+    return request.url.scheme == "https"
+
+
+def _set_session_cookie(response: Response, request: Request, sid: str) -> None:
     response.set_cookie(
         key=SESSION_COOKIE,
         value=sid,
         max_age=SESSION_MAX_AGE,
         httponly=True,
         samesite="lax",
-        secure=os.environ.get("KRUZHCL_SECURE_COOKIES", "").lower() in ("1", "true", "yes"),
+        secure=_cookie_secure(request),
     )
 
 
-def _resolve_sid(response: Response, kruzhcl_sid: str | None) -> str:
+def _resolve_sid(response: Response, request: Request, kruzhcl_sid: str | None) -> str:
     if kruzhcl_sid and kruzhcl_sid.strip():
         return kruzhcl_sid.strip()
     sid = uuid.uuid4().hex
-    _set_session_cookie(response, sid)
+    _set_session_cookie(response, request, sid)
     return sid
 
 
@@ -118,10 +135,11 @@ app.mount(
 
 @app.get("/api/quota")
 def get_quota(
+    request: Request,
     response: Response,
     kruzhcl_sid: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    sid = _resolve_sid(response, kruzhcl_sid)
+    sid = _resolve_sid(response, request, kruzhcl_sid)
     with _store_lock:
         sessions = _load_json(SESSIONS_FILE)
         st = _session_state(sessions, sid)
@@ -136,6 +154,7 @@ def get_quota(
 
 @app.post("/api/upload")
 async def upload_video(
+    request: Request,
     response: Response,
     file: UploadFile = File(...),
     kruzhcl_sid: str | None = Cookie(default=None, alias=SESSION_COOKIE),
@@ -152,7 +171,7 @@ async def upload_video(
     if len(body) < 100:
         raise HTTPException(status_code=400, detail="Video too small")
 
-    sid = _resolve_sid(response, kruzhcl_sid)
+    sid = _resolve_sid(response, request, kruzhcl_sid)
 
     if hub.enabled():
         try:
@@ -191,10 +210,11 @@ async def upload_video(
 
 @app.get("/api/random")
 def random_video(
+    request: Request,
     response: Response,
     kruzhcl_sid: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ):
-    sid = _resolve_sid(response, kruzhcl_sid)
+    sid = _resolve_sid(response, request, kruzhcl_sid)
     with _store_lock:
         sessions = _load_json(SESSIONS_FILE)
         st = _session_state(sessions, sid)

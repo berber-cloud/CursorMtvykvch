@@ -7,7 +7,8 @@ RUN useradd -m -u 1000 user \
 WORKDIR /home/user/app
 
 ENV KRUZHCL_DATA=/data/kruzchl
-ENV KRUZHCL_SECURE_COOKIES=1
+# Secure-cookie по умолчанию определяется по X-Forwarded-Proto (см. main.py).
+# Принудительно: KRUZHCL_SECURE_COOKIES=1 или =0
 
 COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip \
