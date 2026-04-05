@@ -1,12 +1,12 @@
 FROM python:3.11-slim
 
 RUN useradd -m -u 1000 user \
-    && mkdir -p /data/kruzhcl/videos \
+    && mkdir -p /data/kruzchl/videos \
     && chown -R user:user /data
 
 WORKDIR /home/user/app
 
-ENV KRUZHCL_DATA=/data/kruzhcl
+ENV KRUZHCL_DATA=/data/kruzchl
 ENV KRUZHCL_SECURE_COOKIES=1
 
 COPY --chown=user requirements.txt .

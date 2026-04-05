@@ -25,7 +25,7 @@ jobs:
           fi
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
-          git clone --depth 1 "https://Matveykovich:${HF_TOKEN}@huggingface.co/spaces/Matveykovich/kruzhcl.git" hf-space
+          git clone --depth 1 "https://Matveykovich:${HF_TOKEN}@huggingface.co/spaces/Matveykovich/Kruzchl.git" hf-space
           rsync -a --delete \
             --exclude='.git' \
             --exclude='hf-space' \

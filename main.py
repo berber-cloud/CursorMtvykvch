@@ -1,6 +1,6 @@
 """
-Kruzhcl API: upload circular video messages and fetch random ones from others.
-Uses /data/kruzhcl when the HF persistent volume is mounted, else ./data.
+Kruzchl API: upload circular video messages and fetch random ones from others.
+Uses /data/kruzchl when the HF persistent volume is mounted, else ./data.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def _pick_data_root() -> Path:
     candidates = []
     if env:
         candidates.append(Path(env))
-    candidates.append(Path("/data/kruzhcl"))
+    candidates.append(Path("/data/kruzchl"))
     candidates.append(Path(__file__).resolve().parent / "data")
 
     for p in candidates:
@@ -103,7 +103,7 @@ def _remaining(state: dict) -> int:
     return max(0, _credits(state) - int(state.get("views", 0)))
 
 
-app = FastAPI(title="Kruzhcl")
+app = FastAPI(title="Kruzchl")
 
 app.mount(
     "/static",

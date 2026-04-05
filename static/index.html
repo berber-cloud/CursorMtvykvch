@@ -3,10 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <title>Kruzhcl</title>
+    <title>Kruzchl</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
+    <div class="perm-overlay" id="permOverlay" role="dialog" aria-modal="true" aria-labelledby="permTitle" aria-describedby="permDesc">
+      <div class="perm-card">
+        <h1 class="perm-title" id="permTitle">Доступ к камере и микрофону</h1>
+        <p class="perm-desc" id="permDesc">
+          Сайту нужно разрешение браузера, чтобы записывать круглое видео и звук. Данные не отправляются, пока вы не закончите запись и не загрузите кружок.
+        </p>
+        <button type="button" class="perm-btn" id="btnAllowMedia">Разрешить доступ к камере и микрофону</button>
+        <p class="perm-hint" id="permError" hidden></p>
+      </div>
+    </div>
+
     <div class="app">
       <header class="top">
         <p class="hint" id="quotaLine">Загрузка…</p>

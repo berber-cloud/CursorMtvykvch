@@ -1,5 +1,5 @@
 ---
-title: Kruzhcl
+title: Kruzchl
 emoji: 📹
 colorFrom: gray
 colorTo: blue
@@ -8,7 +8,9 @@ app_port: 7860
 pinned: false
 ---
 
-# Kruzhcl
+# Kruzchl
+
+Space: [huggingface.co/spaces/Matveykovich/Kruzchl](https://huggingface.co/spaces/Matveykovich/Kruzchl)
 
 Круглые видеосообщения («кружки»): запись в браузере и просмотр случайных кружков других пользователей. **1 запись = 5 просмотров** чужих видео.
 
@@ -25,6 +27,6 @@ uvicorn main:app --reload --host 0.0.0.0 --port 7860
 
 ## GitHub → Hugging Face
 
-В настройках репозитория GitHub добавьте секрет `HF_TOKEN` — токен Hugging Face с правом **write** для репозитория Space.
+В настройках репозитория GitHub добавьте секрет `HF_TOKEN` — [Personal Access Token](https://huggingface.co/settings/tokens) или **fine-grained** токен с правом **write** на репозиторий Space `Matveykovich/Kruzchl` (и при необходимости на организацию).
 
-После пуша в ветку `main` workflow выкладывает файлы в `spaces/Matveykovich/kruzhcl`.
+После пуша в ветку `main` workflow выкладывает файлы в [spaces/Matveykovich/Kruzchl](https://huggingface.co/spaces/Matveykovich/Kruzchl).

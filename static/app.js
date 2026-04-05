@@ -1,7 +1,9 @@
 const MAX_RECORD_MS = 60_000;
 
 const videoEl = document.getElementById("video");
-const circleFrame = document.getElementById("circleFrame");
+const permOverlay = document.getElementById("permOverlay");
+const btnAllowMedia = document.getElementById("btnAllowMedia");
+const permError = document.getElementById("permError");
 const btnRecord = document.getElementById("btnRecord");
 const btnFlip = document.getElementById("btnFlip");
 const btnRandom = document.getElementById("btnRandom");
@@ -14,6 +16,21 @@ let recorder = null;
 let chunks = [];
 let recordTimer = null;
 let playingExternal = false;
+
+function showPermError(message) {
+  permError.textContent = message;
+  permError.hidden = false;
+}
+
+function clearPermError() {
+  permError.hidden = true;
+  permError.textContent = "";
+}
+
+function setCameraControlsDisabled(disabled) {
+  btnRecord.disabled = disabled;
+  btnFlip.disabled = disabled;
+}
 
 function pickMimeType() {
   const candidates = [
@@ -48,6 +65,9 @@ async function refreshQuota() {
 }
 
 async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Браузер не поддерживает доступ к камере (нужен HTTPS или localhost).");
+  }
   if (stream) {
     stream.getTracks().forEach((t) => t.stop());
   }
@@ -69,8 +89,38 @@ function setMirror(forCamera) {
   videoEl.style.setProperty("--mirror", forCamera ? "-1" : "1");
 }
 
+btnAllowMedia.addEventListener("click", async () => {
+  clearPermError();
+  btnAllowMedia.disabled = true;
+  try {
+    await startCamera();
+    setMirror(facingMode === "user");
+    permOverlay.hidden = true;
+    setCameraControlsDisabled(false);
+    statusLine.textContent = "";
+    await refreshQuota();
+  } catch (e) {
+    const name = e && e.name ? e.name : "";
+    if (name === "NotAllowedError" || name === "PermissionDeniedError") {
+      showPermError("Доступ запрещён. Разрешите камеру и микрофон в настройках сайта в браузере и нажмите снова.");
+    } else if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      showPermError("Камера или микрофон не найдены.");
+    } else {
+      showPermError(e.message || "Не удалось получить доступ к устройствам.");
+    }
+    console.error(e);
+  } finally {
+    btnAllowMedia.disabled = false;
+  }
+});
+
 btnFlip.addEventListener("click", async () => {
   if (playingExternal) return;
+  if (!stream) {
+    permOverlay.hidden = false;
+    showPermError("Сначала разрешите доступ к камере.");
+    return;
+  }
   facingMode = facingMode === "user" ? "environment" : "user";
   try {
     await startCamera();
@@ -124,19 +174,18 @@ btnRecord.addEventListener("click", async () => {
       statusLine.textContent = "";
       await refreshQuota();
     } catch (e) {
-      statusLine.textContent = "Не удалось снова включить камеру";
+      permOverlay.hidden = false;
+      showPermError("Снова разрешите доступ к камере и микрофону.");
       console.error(e);
     }
     return;
   }
+
   if (!stream) {
-    try {
-      await startCamera();
-      setMirror(facingMode === "user");
-    } catch (e) {
-      statusLine.textContent = "Нужен доступ к камере и микрофону";
-      return;
-    }
+    permOverlay.hidden = false;
+    clearPermError();
+    statusLine.textContent = "Нажмите «Разрешить доступ к камере и микрофону»";
+    return;
   }
 
   if (recorder && recorder.state === "recording") {
@@ -227,13 +276,14 @@ videoEl.addEventListener("ended", () => {
 
 (async function init() {
   setMirror(true);
-  try {
-    await startCamera();
-    await refreshQuota();
-    statusLine.textContent = "";
-  } catch (e) {
-    quotaLine.textContent = "Разрешите камеру и микрофон";
-    statusLine.textContent = "Нажмите запись после разрешения доступа";
-    console.error(e);
+  setCameraControlsDisabled(true);
+  clearPermError();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    permOverlay.hidden = false;
+    showPermError("Откройте сайт по HTTPS (или localhost), чтобы браузер разрешил камеру и микрофон.");
+    btnAllowMedia.disabled = true;
   }
+
+  await refreshQuota();
 })();
