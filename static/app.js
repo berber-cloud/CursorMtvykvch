@@ -1,6 +1,11 @@
 const MAX_RECORD_MS = 60_000;
+const RECORD_LIMIT_SEC = 60;
+const SESSION_STORAGE_KEY = "kruzchl_session_id";
 
 const videoEl = document.getElementById("video");
+const circleWrap = document.getElementById("circleWrap");
+const recordRingProgress = document.getElementById("recordRingProgress");
+const recordTimerText = document.getElementById("recordTimerText");
 const permOverlay = document.getElementById("permOverlay");
 const btnAllowMedia = document.getElementById("btnAllowMedia");
 const permError = document.getElementById("permError");
@@ -15,7 +20,65 @@ let facingMode = "user";
 let recorder = null;
 let chunks = [];
 let recordTimer = null;
+let recordRingRaf = null;
+let recordStartedAt = 0;
 let playingExternal = false;
+
+function formatCountdown(remainingMs) {
+  const totalSec = Math.max(0, Math.ceil(remainingMs / 1000));
+  const mm = Math.floor(totalSec / 60);
+  const ss = totalSec % 60;
+  return `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+function setRecordRingProgress(p) {
+  if (!recordRingProgress) return;
+  const clamped = Math.min(1, Math.max(0, p));
+  recordRingProgress.style.strokeDashoffset = String(100 * (1 - clamped));
+}
+
+function startRecordRingAnim() {
+  stopRecordRingAnim();
+  recordStartedAt = performance.now();
+  if (recordTimerText) {
+    recordTimerText.hidden = false;
+    recordTimerText.textContent = formatCountdown(MAX_RECORD_MS);
+  }
+  const tick = (now) => {
+    const elapsed = now - recordStartedAt;
+    const p = elapsed / MAX_RECORD_MS;
+    setRecordRingProgress(p);
+    if (recordTimerText) {
+      recordTimerText.textContent = formatCountdown(MAX_RECORD_MS - elapsed);
+    }
+    if (p < 1 && recorder && recorder.state === "recording") {
+      recordRingRaf = requestAnimationFrame(tick);
+    } else {
+      setRecordRingProgress(1);
+      if (recordTimerText && p >= 1) {
+        recordTimerText.textContent = "0:00";
+      }
+    }
+  };
+  recordRingRaf = requestAnimationFrame(tick);
+}
+
+function stopRecordRingAnim() {
+  if (recordRingRaf) {
+    cancelAnimationFrame(recordRingRaf);
+    recordRingRaf = null;
+  }
+}
+
+function resetRecordRing() {
+  stopRecordRingAnim();
+  setRecordRingProgress(0);
+  if (circleWrap) circleWrap.classList.remove("is-recording");
+  if (recordTimerText) {
+    recordTimerText.hidden = true;
+    recordTimerText.textContent = "";
+  }
+}
 
 function showPermError(message) {
   permError.textContent = message;
@@ -30,6 +93,28 @@ function clearPermError() {
 function setCameraControlsDisabled(disabled) {
   btnRecord.disabled = disabled;
   btnFlip.disabled = disabled;
+}
+
+function rememberSessionId(data) {
+  const id = data && data.session_id;
+  if (typeof id === "string" && /^[a-f0-9]{32}$/.test(id)) {
+    try {
+      sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+    } catch (_) {
+      /* private mode */
+    }
+  }
+}
+
+function sessionFetchHeaders() {
+  const sid = (() => {
+    try {
+      return sessionStorage.getItem(SESSION_STORAGE_KEY);
+    } catch (_) {
+      return null;
+    }
+  })();
+  return sid ? { "X-Kruzchl-Session": sid } : {};
 }
 
 function pickMimeType() {
@@ -48,14 +133,18 @@ function pickMimeType() {
 
 async function refreshQuota() {
   try {
-    const r = await fetch("/api/quota", { credentials: "include" });
+    const r = await fetch("/api/quota", {
+      credentials: "include",
+      headers: { ...sessionFetchHeaders() },
+    });
     if (!r.ok) throw new Error("quota");
     const q = await r.json();
+    rememberSessionId(q);
     const rem = q.views_remaining ?? 0;
     const up = q.uploads ?? 0;
     quotaLine.textContent =
       up === 0
-        ? `Запишите кружок — получите ${q.views_per_upload ?? 5} просмотров чужих`
+        ? `Запишите кружок (до ${RECORD_LIMIT_SEC} с) — получите ${q.views_per_upload ?? 5} просмотров чужих`
         : `Ваших записей: ${up}. Осталось просмотров чужих: ${rem}`;
     return q;
   } catch {
@@ -155,6 +244,7 @@ function stopRecording() {
   /* recorder очищается в onstop — нельзя занулять до вызова onstop, иначе падает чтение mimeType */
   btnRecord.classList.remove("recording");
   btnRecord.disabled = false;
+  resetRecordRing();
   statusLine.textContent = "Сохранение записи…";
 }
 
@@ -166,12 +256,14 @@ async function uploadBlob(blob) {
     method: "POST",
     body: fd,
     credentials: "include",
+    headers: { ...sessionFetchHeaders() },
   });
   if (!r.ok) {
     const t = await r.text();
     throw new Error(t || "upload failed");
   }
-  await r.json();
+  const up = await r.json();
+  rememberSessionId(up);
   statusLine.textContent = "Готово! Можно смотреть чужие кружки.";
   await refreshQuota();
 }
@@ -237,9 +329,21 @@ btnRecord.addEventListener("click", async () => {
     }
   };
 
-  recorder.start(200);
+  try {
+    recorder.start(200);
+  } catch (e) {
+    btnRecord.classList.remove("recording");
+    resetRecordRing();
+    statusLine.textContent = "Не удалось начать запись";
+    console.error(e);
+    return;
+  }
+
   btnRecord.classList.add("recording");
-  statusLine.textContent = "Идёт запись…";
+  setRecordRingProgress(0);
+  if (circleWrap) circleWrap.classList.add("is-recording");
+  startRecordRingAnim();
+  statusLine.textContent = `Идёт запись… макс. ${RECORD_LIMIT_SEC} с`;
 
   recordTimer = setTimeout(() => {
     if (recorder && recorder.state === "recording") {
@@ -252,7 +356,10 @@ btnRecord.addEventListener("click", async () => {
 btnRandom.addEventListener("click", async () => {
   statusLine.textContent = "";
   try {
-    const r = await fetch("/api/random", { credentials: "include" });
+    const r = await fetch("/api/random", {
+      credentials: "include",
+      headers: { ...sessionFetchHeaders() },
+    });
     if (r.status === 403) {
       const err = await r.json().catch(() => ({}));
       statusLine.textContent = err.detail || "Сначала запишите свой кружок";
@@ -266,6 +373,7 @@ btnRandom.addEventListener("click", async () => {
     }
     if (!r.ok) throw new Error("random");
     const data = await r.json();
+    rememberSessionId(data);
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       stream = null;

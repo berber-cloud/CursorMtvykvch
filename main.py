@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import uuid
 from pathlib import Path
 from threading import Lock
@@ -21,8 +22,10 @@ from fastapi.staticfiles import StaticFiles
 import hub_storage as hub
 
 SESSION_COOKIE = "kruzhcl_sid"
+SESSION_HEADER = "x-kruzchl-session"
 SESSION_MAX_AGE = 60 * 60 * 24 * 400  # ~400 days
 VIEWS_PER_UPLOAD = 5
+_SID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 _store_lock = Lock()
 
@@ -55,9 +58,25 @@ def _set_session_cookie(response: Response, request: Request, sid: str) -> None:
     )
 
 
+def _normalize_sid(value: str | None) -> str | None:
+    if not value:
+        return None
+    s = value.strip()
+    return s if _SID_RE.match(s) else None
+
+
 def _resolve_sid(response: Response, request: Request, kruzhcl_sid: str | None) -> str:
-    if kruzhcl_sid and kruzhcl_sid.strip():
-        return kruzhcl_sid.strip()
+    """
+    Сессия: cookie (HttpOnly) или заголовок X-Kruzchl-Session (дублируется в sessionStorage на клиенте).
+    Нужно, когда cookie не цепляется (iframe HF, блокировщики, прокси).
+    """
+    cookie_sid = _normalize_sid(kruzhcl_sid)
+    header_sid = _normalize_sid(request.headers.get(SESSION_HEADER))
+    sid = cookie_sid or header_sid
+    if sid:
+        if not cookie_sid and header_sid:
+            _set_session_cookie(response, request, sid)
+        return sid
     sid = uuid.uuid4().hex
     _set_session_cookie(response, request, sid)
     return sid
@@ -149,6 +168,7 @@ def get_quota(
             "views_remaining": _remaining(st),
             "views_per_upload": VIEWS_PER_UPLOAD,
             "storage": "hub" if hub.enabled() else "local",
+            "session_id": sid,
         }
 
 
@@ -205,6 +225,7 @@ async def upload_video(
         "id": name,
         "views_remaining": _remaining(st),
         "uploads": int(st.get("uploads", 0)),
+        "session_id": sid,
     }
 
 
@@ -241,6 +262,7 @@ def random_video(
                 "url": f"/media/hub?p={enc}",
                 "filename": basename,
                 "views_remaining": views_remaining,
+                "session_id": sid,
             }
 
         owners = _load_json(OWNERS_FILE)
@@ -269,6 +291,7 @@ def random_video(
         "url": f"/media/{pick}",
         "filename": pick,
         "views_remaining": views_remaining,
+        "session_id": sid,
     }
 
 
