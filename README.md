@@ -14,7 +14,17 @@ Space: [huggingface.co/spaces/Matveykovich/Kruzchl](https://huggingface.co/space
 
 Круглые видеосообщения («кружки»): запись в браузере и просмотр случайных кружков других пользователей. **1 запись = 5 просмотров** чужих видео.
 
-Файлы хранятся на диске Space (для сохранения между перезапусками включите [persistent storage](https://huggingface.co/docs/hub/spaces-storage) и используйте каталог `/data`).
+Файлы по умолчанию — на диске Space (для сохранения между перезапусками: [persistent storage](https://huggingface.co/docs/hub/spaces-storage), каталог `/data`).
+
+### Хранение кружков в Hugging Face (Dataset)
+
+1. Создайте **пустой Dataset** на Hub, например `ВашНик/kruzchl-videos` (можно приватный).
+2. В настройках **Space** → **Variables and secrets** добавьте:
+   - **Secret** `HF_TOKEN` — токен с правом **записи** в этот dataset (и чтения списка файлов).
+   - **Variable** `HF_KRUZHKI_REPO` = `ВашНик/kruzchl-videos` (точное имя репозитория).
+3. Перезапустите Space. Видео уходят в ветку `main` репозитория в папку `kruzhki/`; рядом лежат маленькие файлы `.owner` с id сессии (для квоты «не показывать свои»).
+
+Если `HF_KRUZHKI_REPO` не задан, используется локальная папка `videos/` как раньше.
 
 ## Локальный запуск
 

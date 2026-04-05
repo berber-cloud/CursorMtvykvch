@@ -1,6 +1,7 @@
 """
 Kruzchl API: upload circular video messages and fetch random ones from others.
 Uses /data/kruzchl when the HF persistent volume is mounted, else ./data.
+Videos can be stored on the Hugging Face Hub dataset (see hub_storage) when HF_KRUZHKI_REPO + HF_TOKEN are set.
 """
 
 from __future__ import annotations
@@ -11,10 +12,13 @@ import random
 import uuid
 from pathlib import Path
 from threading import Lock
+from urllib.parse import quote, unquote
 
-from fastapi import Cookie, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Cookie, FastAPI, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+import hub_storage as hub
 
 SESSION_COOKIE = "kruzhcl_sid"
 SESSION_MAX_AGE = 60 * 60 * 24 * 400  # ~400 days
@@ -126,6 +130,7 @@ def get_quota(
             "views_used": int(st.get("views", 0)),
             "views_remaining": _remaining(st),
             "views_per_upload": VIEWS_PER_UPLOAD,
+            "storage": "hub" if hub.enabled() else "local",
         }
 
 
@@ -143,24 +148,38 @@ async def upload_video(
     if "mp4" in ctype:
         ext = ".mp4"
 
-    vid = uuid.uuid4().hex
-    name = f"{vid}{ext}"
-    path = VIDEOS_DIR / name
-
     body = await file.read()
     if len(body) < 100:
         raise HTTPException(status_code=400, detail="Video too small")
 
     sid = _resolve_sid(response, kruzhcl_sid)
-    with _store_lock:
-        sessions = _load_json(SESSIONS_FILE)
-        owners = _load_json(OWNERS_FILE)
-        st = _session_state(sessions, sid)
-        st["uploads"] = int(st.get("uploads", 0)) + 1
-        path.write_bytes(body)
-        owners[name] = sid
-        _save_json(SESSIONS_FILE, sessions)
-        _save_json(OWNERS_FILE, owners)
+
+    if hub.enabled():
+        try:
+            name = hub.save_video(body, ext, sid)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Не удалось сохранить в Hub: {e!s}",
+            ) from e
+        with _store_lock:
+            sessions = _load_json(SESSIONS_FILE)
+            st = _session_state(sessions, sid)
+            st["uploads"] = int(st.get("uploads", 0)) + 1
+            _save_json(SESSIONS_FILE, sessions)
+    else:
+        vid = uuid.uuid4().hex
+        name = f"{vid}{ext}"
+        path = VIDEOS_DIR / name
+        with _store_lock:
+            sessions = _load_json(SESSIONS_FILE)
+            owners = _load_json(OWNERS_FILE)
+            st = _session_state(sessions, sid)
+            st["uploads"] = int(st.get("uploads", 0)) + 1
+            path.write_bytes(body)
+            owners[name] = sid
+            _save_json(SESSIONS_FILE, sessions)
+            _save_json(OWNERS_FILE, owners)
 
     return {
         "ok": True,
@@ -178,7 +197,6 @@ def random_video(
     sid = _resolve_sid(response, kruzhcl_sid)
     with _store_lock:
         sessions = _load_json(SESSIONS_FILE)
-        owners = _load_json(OWNERS_FILE)
         st = _session_state(sessions, sid)
 
         if _remaining(st) <= 0:
@@ -187,6 +205,25 @@ def random_video(
                 detail="Нет просмотров: сначала запишите свой кружок (1 запись = 5 просмотров чужих).",
             )
 
+        if hub.enabled():
+            picked = hub.pick_random_video(sid)
+            if not picked:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Пока нет чужих кружков. Загляните позже или попросите друзей записать.",
+                )
+            rel_path, basename = picked
+            st["views"] = int(st.get("views", 0)) + 1
+            views_remaining = _remaining(st)
+            _save_json(SESSIONS_FILE, sessions)
+            enc = quote(rel_path, safe="")
+            return {
+                "url": f"/media/hub?p={enc}",
+                "filename": basename,
+                "views_remaining": views_remaining,
+            }
+
+        owners = _load_json(OWNERS_FILE)
         candidates = []
         for f in VIDEOS_DIR.iterdir():
             if not f.is_file():
@@ -213,6 +250,24 @@ def random_video(
         "filename": pick,
         "views_remaining": views_remaining,
     }
+
+
+@app.get("/media/hub")
+def media_hub(p: str = Query(..., min_length=3, max_length=512)):
+    if not hub.enabled():
+        raise HTTPException(status_code=404)
+    raw = unquote(p)
+    if ".." in raw or raw.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if not raw.startswith(f"{hub.PREFIX}/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    try:
+        local = hub.local_path_for_playback(raw)
+    except Exception:
+        raise HTTPException(status_code=404)
+    suffix = Path(raw).suffix.lower()
+    media = "video/webm" if suffix == ".webm" else "video/mp4"
+    return FileResponse(local, media_type=media, content_disposition_type="inline")
 
 
 @app.get("/media/{filename}")

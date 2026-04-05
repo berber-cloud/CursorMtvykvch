@@ -136,12 +136,26 @@ function stopRecording() {
     clearTimeout(recordTimer);
     recordTimer = null;
   }
-  if (recorder && recorder.state !== "inactive") {
-    recorder.stop();
+  const rec = recorder;
+  if (rec && rec.state === "recording") {
+    try {
+      if (typeof rec.requestData === "function") {
+        rec.requestData();
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      rec.stop();
+    } catch (_) {
+      recorder = null;
+      statusLine.textContent = "Не удалось завершить запись. Попробуйте ещё раз.";
+    }
   }
-  recorder = null;
+  /* recorder очищается в onstop — нельзя занулять до вызова onstop, иначе падает чтение mimeType */
   btnRecord.classList.remove("recording");
   btnRecord.disabled = false;
+  statusLine.textContent = "Сохранение записи…";
 }
 
 async function uploadBlob(blob) {
@@ -205,8 +219,10 @@ btnRecord.addEventListener("click", async () => {
     if (e.data && e.data.size) chunks.push(e.data);
   };
 
-  recorder.onstop = async () => {
-    const type = recorder.mimeType || "video/webm";
+  recorder.onstop = async (ev) => {
+    const rec = ev.target;
+    recorder = null;
+    const type = (rec && rec.mimeType) || "video/webm";
     const blob = new Blob(chunks, { type });
     chunks = [];
     if (blob.size < 200) {
