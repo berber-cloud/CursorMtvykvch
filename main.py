@@ -12,7 +12,8 @@ import random
 import re
 import uuid
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from time import sleep
 from urllib.parse import quote, unquote
 
 from fastapi import Cookie, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
@@ -20,6 +21,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import hub_storage as hub
+from moderation import moderate_video_bytes
 
 SESSION_COOKIE = "kruzhcl_sid"
 SESSION_HEADER = "x-kruzchl-session"
@@ -108,6 +110,8 @@ DATA_ROOT = _pick_data_root()
 VIDEOS_DIR = DATA_ROOT / "videos"
 SESSIONS_FILE = DATA_ROOT / "sessions.json"
 OWNERS_FILE = DATA_ROOT / "owners.json"
+MODERATION_FILE = DATA_ROOT / "moderation_rejected.json"
+HUB_SYNC_FILE = DATA_ROOT / "hub_synced.json"
 
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -129,6 +133,123 @@ def _save_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
+def _load_rejected() -> dict[str, str]:
+    raw = _load_json(MODERATION_FILE)
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
+def _mark_rejected(video_id: str, reason: str) -> None:
+    with _store_lock:
+        rej = _load_rejected()
+        rej[video_id] = reason
+        _save_json(MODERATION_FILE, rej)
+
+
+def _is_rejected(video_id: str) -> bool:
+    rej = _load_rejected()
+    return video_id in rej
+
+
+def _moderate_or_ok(video_id: str, body: bytes, ext: str) -> None:
+    """
+    Raises HTTPException(422) if rejected; otherwise returns None.
+    """
+    if _is_rejected(video_id):
+        raise HTTPException(status_code=422, detail="Видео отклонено модерацией.")
+    res = moderate_video_bytes(body, ext)
+    if not res.ok:
+        _mark_rejected(video_id, res.reason or "rejected")
+        raise HTTPException(
+            status_code=422,
+            detail="Видео отклонено модерацией (чёрный экран/потолок/стена).",
+        )
+
+
+def _retry(fn, *, attempts: int = 4, base_sleep_s: float = 0.5):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            sleep(base_sleep_s * (2**i))
+    if last:
+        raise last
+
+
+def _load_synced() -> dict[str, int]:
+    raw = _load_json(HUB_SYNC_FILE)
+    if isinstance(raw, dict):
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = int(v)
+            except Exception:
+                out[str(k)] = 1
+        return out
+    return {}
+
+
+def _mark_synced(name: str) -> None:
+    with _store_lock:
+        synced = _load_synced()
+        synced[name] = 1
+        _save_json(HUB_SYNC_FILE, synced)
+
+
+def _sync_local_to_hub_loop() -> None:
+    """
+    Best-effort синхронизация локального кэша в Dataset.
+    Нужна, чтобы при пиковых сбоях Hub видео не "застревали" навсегда.
+    """
+    while True:
+        try:
+            if not hub.enabled():
+                sleep(15)
+                continue
+
+            owners = _load_json(OWNERS_FILE)
+            synced = _load_synced()
+
+            # Берём небольшой батч, чтобы не перегружать Hub.
+            batch: list[str] = []
+            for f in VIDEOS_DIR.iterdir():
+                if not f.is_file() or f.suffix.lower() not in (".webm", ".mp4"):
+                    continue
+                if f.name in synced:
+                    continue
+                batch.append(f.name)
+                if len(batch) >= 6:
+                    break
+
+            if not batch:
+                sleep(10)
+                continue
+
+            for name in batch:
+                if _is_rejected(name):
+                    _mark_synced(name)
+                    continue
+                p = VIDEOS_DIR / name
+                if not p.is_file():
+                    continue
+                sid = str(owners.get(name, "")).strip() or "unknown"
+                body = p.read_bytes()
+                ext = p.suffix.lower()
+                try:
+                    _retry(lambda: hub.upload_video_pair(body, ext, sid, name=name), attempts=5)
+                    _mark_synced(name)
+                except Exception:
+                    # Отложим до следующей итерации.
+                    pass
+
+        except Exception:
+            pass
+        sleep(2)
+
+
 def _session_state(sessions: dict, sid: str) -> dict:
     if sid not in sessions:
         sessions[sid] = {"uploads": 0, "views": 0}
@@ -144,6 +265,12 @@ def _remaining(state: dict) -> int:
 
 
 app = FastAPI(title="Kruzchl")
+
+
+@app.on_event("startup")
+def _startup():
+    t = Thread(target=_sync_local_to_hub_loop, daemon=True)
+    t.start()
 
 app.mount(
     "/static",
@@ -193,32 +320,38 @@ async def upload_video(
 
     sid = _resolve_sid(response, request, kruzhcl_sid)
 
+    vid = uuid.uuid4().hex
+    name = f"{vid}{ext}"
+
+    # Модерация на входе (при записи).
+    _moderate_or_ok(name, body, ext)
+
+    stored_as = "local"
     if hub.enabled():
+        # Не даём сервису падать при пиках/сетевых сбоях: ретраи, затем фолбэк на локальный диск.
         try:
-            name = hub.save_video(body, ext, sid)
-        except Exception as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Не удалось сохранить в Hub: {e!s}",
-            ) from e
-        with _store_lock:
-            sessions = _load_json(SESSIONS_FILE)
-            st = _session_state(sessions, sid)
-            st["uploads"] = int(st.get("uploads", 0)) + 1
-            _save_json(SESSIONS_FILE, sessions)
-    else:
-        vid = uuid.uuid4().hex
-        name = f"{vid}{ext}"
-        path = VIDEOS_DIR / name
-        with _store_lock:
-            sessions = _load_json(SESSIONS_FILE)
-            owners = _load_json(OWNERS_FILE)
-            st = _session_state(sessions, sid)
-            st["uploads"] = int(st.get("uploads", 0)) + 1
+            stored_as = "hub"
+            _retry(lambda: hub.upload_video_pair(body, ext, sid, name=name))
+            _mark_synced(name)
+        except Exception:
+            stored_as = "local_fallback"
+
+    path = VIDEOS_DIR / name
+    with _store_lock:
+        sessions = _load_json(SESSIONS_FILE)
+        owners = _load_json(OWNERS_FILE)
+        st = _session_state(sessions, sid)
+        st["uploads"] = int(st.get("uploads", 0)) + 1
+
+        # Всегда сохраняем локально (и как кэш, и как защита от сбоев Hub).
+        try:
             path.write_bytes(body)
-            owners[name] = sid
-            _save_json(SESSIONS_FILE, sessions)
-            _save_json(OWNERS_FILE, owners)
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Disk write failed: {e!s}") from e
+
+        owners[name] = sid
+        _save_json(SESSIONS_FILE, sessions)
+        _save_json(OWNERS_FILE, owners)
 
     return {
         "ok": True,
@@ -226,6 +359,7 @@ async def upload_video(
         "views_remaining": _remaining(st),
         "uploads": int(st.get("uploads", 0)),
         "session_id": sid,
+        "stored_as": stored_as,
     }
 
 
@@ -247,30 +381,48 @@ def random_video(
             )
 
         if hub.enabled():
-            picked = hub.pick_random_video(sid)
-            if not picked:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Пока нет чужих кружков. Загляните позже или попросите друзей записать.",
-                )
-            rel_path, basename = picked
-            st["views"] = int(st.get("views", 0)) + 1
-            views_remaining = _remaining(st)
-            _save_json(SESSIONS_FILE, sessions)
-            enc = quote(rel_path, safe="")
-            return {
-                "url": f"/media/hub?p={enc}",
-                "filename": basename,
-                "views_remaining": views_remaining,
-                "session_id": sid,
-            }
+            # Lazy‑модерация для уже существующего датасета: пробуем несколько кандидатов.
+            for _ in range(12):
+                picked = hub.pick_random_video(sid)
+                if not picked:
+                    break
+                rel_path, basename = picked
+                if _is_rejected(basename):
+                    continue
+                try:
+                    local = hub.local_path_for_playback(rel_path)
+                    b = local.read_bytes()
+                    _moderate_or_ok(basename, b, Path(basename).suffix.lower() or ".webm")
+                except HTTPException:
+                    continue
+                except Exception:
+                    # Если модерация/скачивание сломались — не блокируем выдачу полностью.
+                    pass
+
+                st["views"] = int(st.get("views", 0)) + 1
+                views_remaining = _remaining(st)
+                _save_json(SESSIONS_FILE, sessions)
+                enc = quote(rel_path, safe="")
+                return {
+                    "url": f"/media/hub?p={enc}",
+                    "filename": basename,
+                    "views_remaining": views_remaining,
+                    "session_id": sid,
+                }
+
+            raise HTTPException(
+                status_code=404,
+                detail="Пока нет чужих кружков. Загляните позже или попросите друзей записать.",
+            )
 
         owners = _load_json(OWNERS_FILE)
-        candidates = []
+        candidates: list[str] = []
         for f in VIDEOS_DIR.iterdir():
             if not f.is_file():
                 continue
             if f.suffix.lower() not in (".webm", ".mp4"):
+                continue
+            if _is_rejected(f.name):
                 continue
             owner = owners.get(f.name, None)
             if owner != sid:
@@ -282,7 +434,26 @@ def random_video(
                 detail="Пока нет чужих кружков. Загляните позже или попросите друзей записать.",
             )
 
-        pick = random.choice(candidates)
+        # Lazy‑модерация старых локальных файлов.
+        pick = None
+        random.shuffle(candidates)
+        for cand in candidates[:20]:
+            try:
+                b = (VIDEOS_DIR / cand).read_bytes()
+                _moderate_or_ok(cand, b, Path(cand).suffix.lower())
+                pick = cand
+                break
+            except HTTPException:
+                continue
+            except Exception:
+                pick = cand
+                break
+
+        if not pick:
+            raise HTTPException(
+                status_code=404,
+                detail="Пока нет чужих кружков. Загляните позже или попросите друзей записать.",
+            )
         st["views"] = int(st.get("views", 0)) + 1
         views_remaining = _remaining(st)
         _save_json(SESSIONS_FILE, sessions)
@@ -293,6 +464,24 @@ def random_video(
         "views_remaining": views_remaining,
         "session_id": sid,
     }
+
+
+@app.get("/api/stats")
+def stats():
+    if hub.enabled():
+        total_files = hub.count_kruzhki_files()
+        total_videos = total_files // 2
+        return {"storage": "hub", "total_videos": total_videos}
+    total_videos = 0
+    try:
+        total_videos = sum(
+            1
+            for f in VIDEOS_DIR.iterdir()
+            if f.is_file() and f.suffix.lower() in (".webm", ".mp4")
+        )
+    except OSError:
+        total_videos = 0
+    return {"storage": "local", "total_videos": total_videos}
 
 
 @app.get("/media/hub")

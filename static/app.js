@@ -14,6 +14,7 @@ const btnFlip = document.getElementById("btnFlip");
 const btnRandom = document.getElementById("btnRandom");
 const quotaLine = document.getElementById("quotaLine");
 const statusLine = document.getElementById("statusLine");
+const statsLine = document.getElementById("statsLine");
 
 let stream = null;
 let facingMode = "user";
@@ -153,6 +154,21 @@ async function refreshQuota() {
   }
 }
 
+async function refreshStats() {
+  if (!statsLine) return null;
+  try {
+    const r = await fetch("/api/stats", { credentials: "include" });
+    if (!r.ok) throw new Error("stats");
+    const s = await r.json();
+    const total = s.total_videos ?? 0;
+    statsLine.textContent = `Всего видео: ${total}`;
+    return s;
+  } catch {
+    statsLine.textContent = "";
+    return null;
+  }
+}
+
 async function startCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error("Браузер не поддерживает доступ к камере (нужен HTTPS или localhost).");
@@ -266,6 +282,7 @@ async function uploadBlob(blob) {
   rememberSessionId(up);
   statusLine.textContent = "Готово! Можно смотреть чужие кружки.";
   await refreshQuota();
+  await refreshStats();
 }
 
 btnRecord.addEventListener("click", async () => {
@@ -386,6 +403,7 @@ btnRandom.addEventListener("click", async () => {
     await videoEl.play().catch(() => {});
     statusLine.textContent = "Чужой кружок";
     await refreshQuota();
+    await refreshStats();
   } catch (e) {
     statusLine.textContent = "Не удалось загрузить случайный кружок";
     console.error(e);
@@ -410,4 +428,5 @@ videoEl.addEventListener("ended", () => {
   }
 
   await refreshQuota();
+  await refreshStats();
 })();

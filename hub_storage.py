@@ -12,7 +12,7 @@ import uuid
 import io
 from pathlib import Path
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
 PREFIX = "kruzhki"
 
@@ -42,33 +42,40 @@ def _api() -> HfApi:
     return HfApi(token=_token())
 
 
-def save_video(body: bytes, ext: str, owner_sid: str) -> str:
-    """Upload video + owner sidecar. Returns basename e.g. uuid.webm."""
+def upload_video_pair(body: bytes, ext: str, owner_sid: str, *, name: str | None = None) -> str:
+    """
+    Upload video + owner sidecar in a single commit. Returns basename e.g. uuid.webm.
+    """
     repo = _repo()
     api = _api()
-    vid = uuid.uuid4().hex
-    name = f"{vid}{ext}"
-    rel_video = f"{PREFIX}/{name}"
-    rel_owner = f"{PREFIX}/{name}.owner"
+    vid = (name or uuid.uuid4().hex).split(".", 1)[0]
+    filename = name or f"{vid}{ext}"
+    rel_video = f"{PREFIX}/{filename}"
+    rel_owner = f"{PREFIX}/{filename}.owner"
 
-    up_kw: dict = {"repo_id": repo, "repo_type": "dataset"}
+    kw: dict = {"repo_id": repo, "repo_type": "dataset"}
     rev = _hub_revision()
     if rev:
-        up_kw["revision"] = rev
+        kw["revision"] = rev
 
-    api.upload_file(
-        path_or_fileobj=io.BytesIO(body),
-        path_in_repo=rel_video,
-        commit_message=f"kruzchl video {name}",
-        **up_kw,
+    ops = [
+        CommitOperationAdd(path_in_repo=rel_video, path_or_fileobj=io.BytesIO(body)),
+        CommitOperationAdd(
+            path_in_repo=rel_owner,
+            path_or_fileobj=io.BytesIO(owner_sid.encode("utf-8")),
+        ),
+    ]
+    api.create_commit(
+        operations=ops,
+        commit_message=f"kruzchl video {filename}",
+        **kw,
     )
-    api.upload_file(
-        path_or_fileobj=io.BytesIO(owner_sid.encode("utf-8")),
-        path_in_repo=rel_owner,
-        commit_message=f"kruzchl owner {name}",
-        **up_kw,
-    )
-    return name
+    return filename
+
+
+def save_video(body: bytes, ext: str, owner_sid: str) -> str:
+    """Upload video + owner sidecar. Returns basename e.g. uuid.webm."""
+    return upload_video_pair(body, ext, owner_sid)
 
 
 def _normalize_hub_path(item) -> str:
@@ -105,6 +112,32 @@ def _list_kruzhki_video_paths(api: HfApi, repo: str) -> list[str]:
         if low.endswith(".webm") or low.endswith(".mp4"):
             videos.append(p)
     return videos
+
+
+def count_kruzhki_files() -> int:
+    """
+    Всего файлов под kruzhki/ (видео + .owner). В датасете 2 файла на 1 видео,
+    поэтому количество видео = files // 2.
+    """
+    if not enabled():
+        return 0
+    api = _api()
+    repo = _repo()
+    rev = _hub_revision()
+    kw: dict = {"repo_id": repo, "repo_type": "dataset"}
+    if rev:
+        kw["revision"] = rev
+    try:
+        raw = api.list_repo_files(**kw)
+    except Exception:
+        return 0
+    prefix = f"{PREFIX}/".lower()
+    n = 0
+    for item in raw:
+        p = _normalize_hub_path(item).lower()
+        if p.startswith(prefix):
+            n += 1
+    return n
 
 
 def _owner_for_video(api: HfApi, repo: str, video_rel_path: str) -> str | None:
