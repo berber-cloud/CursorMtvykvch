@@ -17,7 +17,7 @@ from time import sleep
 from urllib.parse import quote, unquote
 
 from fastapi import Cookie, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import hub_storage as hub
@@ -152,19 +152,23 @@ def _is_rejected(video_id: str) -> bool:
     return video_id in rej
 
 
-def _moderate_or_ok(video_id: str, body: bytes, ext: str) -> None:
+def _rejection_reason(video_id: str) -> str | None:
+    rej = _load_rejected()
+    return rej.get(video_id)
+
+
+def _moderate_or_ok(video_id: str, body: bytes, suffix: str) -> None:
     """
     Raises HTTPException(422) if rejected; otherwise returns None.
     """
     if _is_rejected(video_id):
-        raise HTTPException(status_code=422, detail="Видео отклонено модерацией.")
-    res = moderate_video_bytes(body, ext)
+        reason = _rejection_reason(video_id) or "rejected"
+        raise HTTPException(status_code=422, detail=f"Video rejected: {reason}")
+
+    res = moderate_video_bytes(body, suffix=suffix)
     if not res.ok:
         _mark_rejected(video_id, res.reason or "rejected")
-        raise HTTPException(
-            status_code=422,
-            detail="Видео отклонено модерацией (чёрный экран/потолок/стена).",
-        )
+        raise HTTPException(status_code=422, detail=f"Video rejected: {res.reason or 'rejected'}")
 
 
 def _retry(fn, *, attempts: int = 4, base_sleep_s: float = 0.5):
@@ -276,7 +280,7 @@ def _premoderate_hub_loop() -> None:
                 try:
                     local = hub.local_path_for_playback(rel)
                     b = local.read_bytes()
-                    _moderate_or_ok(name, b, Path(name).suffix.lower() or ".webm")
+                    _moderate_or_ok(name, b, suffix=Path(name).suffix.lower() or ".webm")
                 except HTTPException:
                     # _moderate_or_ok уже пометил как rejected
                     pass
@@ -366,7 +370,18 @@ async def upload_video(
     name = f"{vid}{ext}"
 
     # Модерация на входе (при записи).
-    _moderate_or_ok(name, body, ext)
+    try:
+        _moderate_or_ok(name, body, suffix=ext)
+    except HTTPException as e:
+        # Явный JSON-ответ для клиента: причина в result.reason.
+        if e.status_code == 422:
+            msg = str(e.detail or "Video rejected")
+            reason = msg.split(":", 1)[1].strip() if ":" in msg else "rejected"
+            return JSONResponse(
+                status_code=422,
+                content={"error": f"Video rejected: {reason}", "reason": reason},
+            )
+        raise
 
     stored_as = "local"
     if hub.enabled():
@@ -434,7 +449,7 @@ def random_video(
                 try:
                     local = hub.local_path_for_playback(rel_path)
                     b = local.read_bytes()
-                    _moderate_or_ok(basename, b, Path(basename).suffix.lower() or ".webm")
+                    _moderate_or_ok(basename, b, suffix=Path(basename).suffix.lower() or ".webm")
                 except HTTPException:
                     continue
                 except Exception:
@@ -482,7 +497,7 @@ def random_video(
         for cand in candidates[:20]:
             try:
                 b = (VIDEOS_DIR / cand).read_bytes()
-                _moderate_or_ok(cand, b, Path(cand).suffix.lower())
+                _moderate_or_ok(cand, b, suffix=Path(cand).suffix.lower())
                 pick = cand
                 break
             except HTTPException:

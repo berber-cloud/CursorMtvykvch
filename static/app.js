@@ -320,7 +320,7 @@ async function uploadBlob(blob) {
     const contentType = r.headers.get("content-type") || "";
     if (contentType.includes("application/json")) {
       const j = await r.json().catch(() => ({}));
-      throw new Error(j.detail || `Ошибка отправки (${r.status})`);
+      throw new Error(j.detail || j.error || `Ошибка отправки (${r.status})`);
     }
     const t = await r.text().catch(() => "");
     throw new Error(t || `Ошибка отправки (${r.status})`);
