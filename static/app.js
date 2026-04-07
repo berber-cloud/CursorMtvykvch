@@ -1,6 +1,8 @@
 const MAX_RECORD_MS = 60_000;
 const RECORD_LIMIT_SEC = 60;
 const SESSION_STORAGE_KEY = "kruzchl_session_id";
+const VIDEO_BPS = 650_000;
+const AUDIO_BPS = 48_000;
 
 const videoEl = document.getElementById("video");
 const circleWrap = document.getElementById("circleWrap");
@@ -15,6 +17,7 @@ const btnRandom = document.getElementById("btnRandom");
 const quotaLine = document.getElementById("quotaLine");
 const statusLine = document.getElementById("statusLine");
 const statsLine = document.getElementById("statsLine");
+const adBanner = document.getElementById("adBanner");
 
 let stream = null;
 let facingMode = "user";
@@ -236,6 +239,39 @@ function setMirror(forCamera) {
   videoEl.style.setProperty("--mirror", forCamera ? "-1" : "1");
 }
 
+async function initAds() {
+  if (!adBanner) return;
+  try {
+    const r = await fetch("/api/ads-config", { credentials: "include" });
+    if (!r.ok) throw new Error("ads");
+    const cfg = await r.json();
+    if (!cfg || !cfg.enabled) {
+      adBanner.hidden = true;
+      return;
+    }
+    const unit = String(cfg.unit_id || "").trim();
+    const src = String(cfg.src || "//acceptable.a-ads.com/1").trim();
+    if (!/^\d+$/.test(unit)) {
+      adBanner.hidden = true;
+      return;
+    }
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("data-aa", unit);
+    iframe.setAttribute("src", src);
+    iframe.setAttribute("loading", "lazy");
+    iframe.setAttribute("referrerpolicy", "no-referrer-when-downgrade");
+    iframe.style.border = "0";
+    iframe.style.padding = "0";
+    iframe.style.overflow = "hidden";
+    iframe.style.backgroundColor = "transparent";
+    adBanner.innerHTML = "";
+    adBanner.appendChild(iframe);
+    adBanner.hidden = false;
+  } catch {
+    adBanner.hidden = true;
+  }
+}
+
 btnAllowMedia.addEventListener("click", async () => {
   clearPermError();
   btnAllowMedia.disabled = true;
@@ -308,6 +344,25 @@ function stopRecording() {
 
 async function uploadBlob(blob) {
   statusLine.textContent = "Отправка…";
+  const attempts = 3;
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await uploadBlobOnce(blob);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const msg = (e && e.message) || "";
+      // Не повторяем модерационные и rate-limit ошибки.
+      if (msg.includes("Video rejected") || msg.includes("429")) throw e;
+      await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  throw lastErr || new Error("upload failed");
+}
+
+async function uploadBlobOnce(blob) {
+  statusLine.textContent = "Отправка…";
   const fd = new FormData();
   fd.append("file", blob, "kruzh.webm");
   const r = await fetch("/api/upload", {
@@ -366,7 +421,9 @@ btnRecord.addEventListener("click", async () => {
   chunks = [];
   const mime = pickMimeType();
   try {
-    recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    recorder = mime
+      ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: VIDEO_BPS, audioBitsPerSecond: AUDIO_BPS })
+      : new MediaRecorder(stream, { videoBitsPerSecond: VIDEO_BPS, audioBitsPerSecond: AUDIO_BPS });
   } catch {
     recorder = new MediaRecorder(stream);
   }
@@ -472,4 +529,5 @@ videoEl.addEventListener("ended", () => {
 
   await refreshQuota();
   await refreshStats();
+  await initAds();
 })();

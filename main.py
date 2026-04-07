@@ -11,6 +11,8 @@ import os
 import random
 import re
 import uuid
+import hashlib
+import time
 from pathlib import Path
 from threading import Lock, Thread
 from time import sleep
@@ -21,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import hub_storage as hub
-from moderation import moderate_video_bytes
+from moderation import moderate_video_bytes, moderate_video_path
 
 SESSION_COOKIE = "kruzhcl_sid"
 SESSION_HEADER = "x-kruzchl-session"
@@ -30,6 +32,18 @@ VIEWS_PER_UPLOAD = 5
 _SID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 _store_lock = Lock()
+_metrics_lock = Lock()
+_metrics: dict[str, int] = {}
+
+
+def _metric_inc(name: str, delta: int = 1) -> None:
+    with _metrics_lock:
+        _metrics[name] = int(_metrics.get(name, 0)) + int(delta)
+
+
+def _metric_snapshot() -> dict[str, int]:
+    with _metrics_lock:
+        return dict(_metrics)
 
 
 def _cookie_secure(request: Request) -> bool:
@@ -112,6 +126,9 @@ SESSIONS_FILE = DATA_ROOT / "sessions.json"
 OWNERS_FILE = DATA_ROOT / "owners.json"
 MODERATION_FILE = DATA_ROOT / "moderation_rejected.json"
 HUB_SYNC_FILE = DATA_ROOT / "hub_synced.json"
+CONTENT_HASHES_FILE = DATA_ROOT / "content_hashes.json"
+PHASH_INDEX_FILE = DATA_ROOT / "perceptual_hashes.json"
+RATE_LIMITS_FILE = DATA_ROOT / "rate_limits.json"
 
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +148,191 @@ def _save_json(path: Path, data: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=0), encoding="utf-8")
     tmp.replace(path)
+
+
+def _now() -> float:
+    return float(time.time())
+
+
+def _client_ip(request: Request) -> str:
+    # Best-effort behind proxies (HF, etc.)
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        ip = xff.split(",")[0].strip()
+        if ip:
+            return ip
+    fwd = request.headers.get("forwarded", "")
+    if "for=" in fwd:
+        try:
+            part = fwd.split("for=", 1)[1].split(";", 1)[0].strip().strip('"')
+            if part:
+                return part
+        except Exception:
+            pass
+    return getattr(getattr(request, "client", None), "host", None) or "unknown"
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def _prune_ts(ts: list[float], *, window_s: int, now: float) -> list[float]:
+    cutoff = now - float(window_s)
+    return [t for t in ts if t >= cutoff]
+
+
+def _rate_limit_check_and_touch(request: Request, sid: str) -> tuple[bool, str | None]:
+    """
+    Returns (allowed, reason). Updates counters when allowed.
+    """
+    sid_per_min = _env_int("KRUZHCL_RATE_SID_PER_MIN", 4)
+    ip_per_min = _env_int("KRUZHCL_RATE_IP_PER_MIN", 10)
+    window_s = 60
+    now = _now()
+    ip = _client_ip(request)
+
+    with _store_lock:
+        raw = _load_json(RATE_LIMITS_FILE)
+        store = raw if isinstance(raw, dict) else {}
+        by_sid = store.get("sid", {}) if isinstance(store.get("sid", {}), dict) else {}
+        by_ip = store.get("ip", {}) if isinstance(store.get("ip", {}), dict) else {}
+
+        sid_ts = [float(x) for x in (by_sid.get(sid, []) if isinstance(by_sid.get(sid, []), list) else [])]
+        ip_ts = [float(x) for x in (by_ip.get(ip, []) if isinstance(by_ip.get(ip, []), list) else [])]
+        sid_ts = _prune_ts(sid_ts, window_s=window_s, now=now)
+        ip_ts = _prune_ts(ip_ts, window_s=window_s, now=now)
+
+        if sid_per_min > 0 and len(sid_ts) >= sid_per_min:
+            _metric_inc("reject.rate_limited_session")
+            by_sid[sid] = sid_ts
+            store["sid"] = by_sid
+            store["ip"] = by_ip
+            _save_json(RATE_LIMITS_FILE, store)
+            return False, "rate_limited_session"
+        if ip_per_min > 0 and len(ip_ts) >= ip_per_min:
+            _metric_inc("reject.rate_limited_ip")
+            by_ip[ip] = ip_ts
+            store["sid"] = by_sid
+            store["ip"] = by_ip
+            _save_json(RATE_LIMITS_FILE, store)
+            return False, "rate_limited_ip"
+
+        sid_ts.append(now)
+        ip_ts.append(now)
+        # Cap lists to avoid unbounded growth.
+        by_sid[sid] = sid_ts[-200:]
+        by_ip[ip] = ip_ts[-400:]
+        store["sid"] = by_sid
+        store["ip"] = by_ip
+        _save_json(RATE_LIMITS_FILE, store)
+        return True, None
+
+
+def _sha256_hex(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest()
+
+
+def _exact_dedup_check_and_touch(sha: str) -> tuple[bool, str | None]:
+    """
+    Returns (allowed, reason). Updates counters.
+    """
+    max_per_hour = _env_int("KRUZHCL_DUP_SHA_MAX_PER_HOUR", 2)
+    window_s = 60 * 60
+    now = _now()
+
+    with _store_lock:
+        raw = _load_json(CONTENT_HASHES_FILE)
+        store = raw if isinstance(raw, dict) else {}
+        rec = store.get(sha, {}) if isinstance(store.get(sha, {}), dict) else {}
+        ts: list[float] = [float(x) for x in (rec.get("ts", []) if isinstance(rec.get("ts", []), list) else [])]
+        ts = _prune_ts(ts, window_s=window_s, now=now)
+        if max_per_hour > 0 and len(ts) >= max_per_hour:
+            _metric_inc("reject.duplicate_exact")
+            rec["ts"] = ts[-50:]
+            rec["last"] = now
+            rec["count"] = int(rec.get("count", 0)) + 1
+            store[sha] = rec
+            _save_json(CONTENT_HASHES_FILE, store)
+            return False, "duplicate_exact"
+
+        ts.append(now)
+        rec["ts"] = ts[-50:]
+        rec["first"] = float(rec.get("first", now))
+        rec["last"] = now
+        rec["count"] = int(rec.get("count", 0)) + 1
+        store[sha] = rec
+        # Cap total keys (simple eviction).
+        if len(store) > _env_int("KRUZHCL_DUP_SHA_MAX_KEYS", 8000):
+            # drop random-ish older keys
+            keys = list(store.keys())
+            random.shuffle(keys)
+            for k in keys[: max(1, len(keys) // 10)]:
+                store.pop(k, None)
+        _save_json(CONTENT_HASHES_FILE, store)
+        return True, None
+
+
+def _hamming64(a_hex: str, b_hex: str) -> int:
+    try:
+        a = int(a_hex, 16)
+        b = int(b_hex, 16)
+    except Exception:
+        return 64
+    return int((a ^ b).bit_count())
+
+
+def _near_dedup_check_and_touch(fp: str) -> tuple[bool, str | None]:
+    """
+    fp: 64-bit hex fingerprint string (len 16).
+    Returns (allowed, reason). Updates index.
+    """
+    if not fp or len(fp) < 8:
+        return True, None
+    max_dist = _env_int("KRUZHCL_DUP_PHASH_MAX_DIST", 6)
+    max_hits = _env_int("KRUZHCL_DUP_PHASH_MAX_HITS", 2)
+    now = _now()
+    window_s = _env_int("KRUZHCL_DUP_PHASH_WINDOW_S", 6 * 60 * 60)
+
+    bucket = fp[:4]
+    with _store_lock:
+        raw = _load_json(PHASH_INDEX_FILE)
+        store = raw if isinstance(raw, dict) else {}
+        buckets = store.get("b", {}) if isinstance(store.get("b", {}), dict) else {}
+        b = buckets.get(bucket, []) if isinstance(buckets.get(bucket, []), list) else []
+
+        # b entries: {"fp":..., "ts":...}
+        kept = []
+        hits = 0
+        for item in b:
+            if not isinstance(item, dict):
+                continue
+            old_fp = str(item.get("fp", "")).strip()
+            old_ts = float(item.get("ts", 0.0) or 0.0)
+            if old_ts < (now - float(window_s)):
+                continue
+            kept.append({"fp": old_fp, "ts": old_ts})
+            if old_fp and _hamming64(fp, old_fp) <= max_dist:
+                hits += 1
+
+        if max_hits > 0 and hits >= max_hits:
+            _metric_inc("reject.duplicate_near")
+            kept.append({"fp": fp, "ts": now})
+            buckets[bucket] = kept[-200:]
+            store["b"] = buckets
+            _save_json(PHASH_INDEX_FILE, store)
+            return False, "duplicate_near"
+
+        kept.append({"fp": fp, "ts": now})
+        buckets[bucket] = kept[-200:]
+        store["b"] = buckets
+        _save_json(PHASH_INDEX_FILE, store)
+        return True, None
 
 
 def _load_rejected() -> dict[str, str]:
@@ -283,8 +485,10 @@ def _premoderate_hub_loop() -> None:
                     _moderate_or_ok(name, b, suffix=Path(name).suffix.lower() or ".webm")
                 except HTTPException:
                     # _moderate_or_ok уже пометил как rejected
+                    _metric_inc("premod.hub.rejected")
                     pass
                 except Exception:
+                    _metric_inc("premod.hub.error")
                     pass
                 checked += 1
                 if checked >= 4:
@@ -360,18 +564,75 @@ async def upload_video(
     if "mp4" in ctype:
         ext = ".mp4"
 
-    body = await file.read()
-    if len(body) < 100:
-        raise HTTPException(status_code=400, detail="Video too small")
-
     sid = _resolve_sid(response, request, kruzhcl_sid)
+
+    allowed, reason = _rate_limit_check_and_touch(request, sid)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"Video rejected: {reason}")
 
     vid = uuid.uuid4().hex
     name = f"{vid}{ext}"
 
+    # Stream-to-disk: быстрее, меньше RAM, устойчивее под нагрузкой.
+    path = VIDEOS_DIR / name
+    chunk_size = _env_int("KRUZHCL_UPLOAD_CHUNK", 2 * 1024 * 1024)
+    h = hashlib.sha256()
+    total = 0
+    try:
+        with path.open("wb") as out:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _env_int("KRUZHCL_MAX_UPLOAD_BYTES", 50 * 1024 * 1024):
+                    raise HTTPException(status_code=413, detail="Upload too large")
+                h.update(chunk)
+                out.write(chunk)
+    except HTTPException:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except Exception as e:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail=f"Disk write failed: {e!s}") from e
+
+    if total < 100:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="Video too small")
+
+    sha = h.hexdigest()
+    allowed, reason = _exact_dedup_check_and_touch(sha)
+    if not allowed:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return JSONResponse(status_code=422, content={"error": f"Video rejected: {reason}", "reason": reason})
+
     # Модерация на входе (при записи).
     try:
-        _moderate_or_ok(name, body, suffix=ext)
+        if _is_rejected(name):
+            raise HTTPException(status_code=422, detail=f"Video rejected: {_rejection_reason(name) or 'rejected'}")
+        res = moderate_video_path(str(path))
+        if not res.ok:
+            _mark_rejected(name, res.reason or "rejected")
+            _metric_inc(f"reject.moderation.{res.reason or 'rejected'}")
+            raise HTTPException(status_code=422, detail=f"Video rejected: {res.reason or 'rejected'}")
+        if getattr(res, "fingerprint", None):
+            allowed, reason = _near_dedup_check_and_touch(str(res.fingerprint))
+            if not allowed:
+                _mark_rejected(name, reason or "duplicate_near")
+                _metric_inc(f"reject.moderation.{reason or 'duplicate_near'}")
+                raise HTTPException(status_code=422, detail=f"Video rejected: {reason or 'duplicate_near'}")
     except HTTPException as e:
         # Явный JSON-ответ для клиента: причина в result.reason.
         if e.status_code == 422:
@@ -383,28 +644,18 @@ async def upload_video(
             )
         raise
 
+    _metric_inc("upload.accepted")
+
     stored_as = "local"
     if hub.enabled():
-        # Не даём сервису падать при пиках/сетевых сбоях: ретраи, затем фолбэк на локальный диск.
-        try:
-            stored_as = "hub"
-            _retry(lambda: hub.upload_video_pair(body, ext, sid, name=name))
-            _mark_synced(name)
-        except Exception:
-            stored_as = "local_fallback"
+        # Local-first: Hub отправляется фоновым синком, чтобы upload отвечал быстро.
+        stored_as = "local_queued"
 
-    path = VIDEOS_DIR / name
     with _store_lock:
         sessions = _load_json(SESSIONS_FILE)
         owners = _load_json(OWNERS_FILE)
         st = _session_state(sessions, sid)
         st["uploads"] = int(st.get("uploads", 0)) + 1
-
-        # Всегда сохраняем локально (и как кэш, и как защита от сбоев Hub).
-        try:
-            path.write_bytes(body)
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Disk write failed: {e!s}") from e
 
         owners[name] = sid
         _save_json(SESSIONS_FILE, sessions)
@@ -539,6 +790,26 @@ def stats():
     except OSError:
         total_videos = 0
     return {"storage": "local", "total_videos": total_videos}
+
+
+@app.get("/api/health")
+def health():
+    # Лёгкий endpoint для наблюдаемости (без внешних зависимостей).
+    return {"ok": True, "metrics": _metric_snapshot()}
+
+
+@app.get("/api/ads-config")
+def ads_config():
+    """
+    A-ADS banner config via env.
+    - AADS_UNIT_ID: numeric id for data-aa attribute
+    - AADS_SRC: optional iframe src (default //acceptable.a-ads.com/1)
+    """
+    unit = os.environ.get("AADS_UNIT_ID", "").strip()
+    if not unit or not unit.isdigit():
+        return {"enabled": False}
+    src = os.environ.get("AADS_SRC", "").strip() or "//acceptable.a-ads.com/1"
+    return {"enabled": True, "unit_id": unit, "src": src}
 
 
 @app.get("/media/hub")

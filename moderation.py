@@ -12,6 +12,7 @@ import numpy as np
 class ModerationResult:
     ok: bool
     reason: str | None = None
+    fingerprint: str | None = None
 
 
 def _env_float(name: str, default: float) -> float:
@@ -37,6 +38,177 @@ def _edge_ratio(gray: np.ndarray) -> float:
     edges = cv2.Canny(gray, 50, 150)
     return np.sum(edges > 0) / gray.size
 
+
+def _dhash64(gray: np.ndarray) -> int:
+    """
+    dHash 8x8 (64-bit). Robust to small changes and re-encoding.
+    """
+    small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+    diff = small[:, 1:] > small[:, :-1]
+    bits = diff.flatten()
+    out = 0
+    for b in bits:
+        out = (out << 1) | int(bool(b))
+    return int(out)
+
+
+def _fingerprint_from_hashes(hashes: list[int]) -> str | None:
+    if not hashes:
+        return None
+    # Majority vote per bit across sampled frames.
+    ones = [0] * 64
+    for h in hashes:
+        for i in range(64):
+            if (h >> (63 - i)) & 1:
+                ones[i] += 1
+    half = (len(hashes) + 1) // 2
+    out = 0
+    for c in ones:
+        out = (out << 1) | (1 if c >= half else 0)
+    return f"{out:016x}"
+
+
+def moderate_video_path(path: str) -> ModerationResult:
+    """
+    Модерация видео по пути к файлу.
+    Быстрее и экономнее, чем bytes→tempfile→decode.
+    """
+    cap = None
+    try:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            return ModerationResult(ok=True, reason=None, fingerprint=None)
+
+        # Настройки (можно менять через переменные окружения)
+        sample_frames = int(_env_float("KRUZHCL_MOD_FRAMES", 24))
+        max_decode_frames = int(_env_float("KRUZHCL_MOD_MAX_DECODE", 300))
+
+        black_mean_thr = _env_float("KRUZHCL_MOD_BLACK_MEAN", 15.0)
+        black_std_thr = _env_float("KRUZHCL_MOD_BLACK_STD", 12.0)
+
+        flat_lap_thr = _env_float("KRUZHCL_MOD_FLAT_LAPLACIAN", 25.0)
+        flat_motion_thr = _env_float("KRUZHCL_MOD_FLAT_MOTION", 2.5)
+        flat_sat_thr = _env_float("KRUZHCL_MOD_FLAT_SAT", 35.0)
+        flat_entropy_thr = _env_float("KRUZHCL_MOD_FLAT_ENTROPY", 3.5)
+        flat_edges_thr = _env_float("KRUZHCL_MOD_FLAT_EDGES", 0.012)
+
+        short_sec = _env_float("KRUZHCL_MOD_SHORT_SECONDS", 5.0)
+        min_sec = _env_float("KRUZHCL_MOD_MIN_SECONDS", 1.0)
+
+        short_flat_lap_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_LAPLACIAN", 20.0)
+        short_flat_motion_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_MOTION", 3.5)
+        short_flat_sat_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_SAT", 45.0)
+        short_flat_entropy_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_ENTROPY", 2.8)
+        short_flat_edges_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_EDGES", 0.008)
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        duration_s = (frame_count / fps) if fps > 0.1 and frame_count > 0.1 else None
+
+        if duration_s is not None and duration_s < min_sec:
+            return ModerationResult(ok=False, reason="too_short", fingerprint=None)
+
+        means = []
+        stds = []
+        laps = []
+        motions = []
+        sats = []
+        entropies = []
+        edges_ratio = []
+        dhashes: list[int] = []
+
+        prev_gray = None
+        decoded = 0
+        kept = 0
+
+        effective_max_decode = max_decode_frames
+        effective_samples = sample_frames
+        if duration_s is not None and duration_s < short_sec:
+            effective_samples = max(sample_frames, 32)
+
+        while decoded < effective_max_decode and kept < effective_samples:
+            ret, frame = cap.read()
+            decoded += 1
+            if not ret or frame is None:
+                break
+
+            stride = max(1, effective_max_decode // max(1, effective_samples))
+            if (decoded % stride) != 0:
+                continue
+
+            h, w = frame.shape[:2]
+            if h <= 0 or w <= 0:
+                continue
+
+            target_w = 224
+            if w != target_w:
+                target_h = int(h * (target_w / w))
+                frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            means.append(float(np.mean(gray)))
+            stds.append(float(np.std(gray)))
+
+            lap = cv2.Laplacian(gray, cv2.CV_64F)
+            laps.append(float(lap.var()))
+
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            sats.append(float(np.mean(hsv[:, :, 1])))
+
+            entropies.append(_image_entropy(gray))
+            edges_ratio.append(_edge_ratio(gray))
+            dhashes.append(_dhash64(gray))
+
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray)
+                motions.append(float(np.mean(diff)))
+            prev_gray = gray
+            kept += 1
+
+        if not means:
+            return ModerationResult(ok=True, reason=None, fingerprint=None)
+
+        fp = _fingerprint_from_hashes(dhashes)
+
+        blackish = [(m < black_mean_thr and s < black_std_thr) for m, s in zip(means, stds)]
+        if sum(blackish) >= max(3, int(0.75 * len(blackish))):
+            return ModerationResult(ok=False, reason="black_screen", fingerprint=fp)
+
+        motion_med = float(np.median(motions)) if motions else 0.0
+        lap_med = float(np.median(laps)) if laps else 0.0
+        sat_med = float(np.median(sats)) if sats else 0.0
+        entropy_med = float(np.median(entropies)) if entropies else 0.0
+        edges_med = float(np.median(edges_ratio)) if edges_ratio else 0.0
+
+        is_short = duration_s is not None and duration_s < short_sec
+        if is_short:
+            if (
+                motion_med < short_flat_motion_thr
+                and lap_med < short_flat_lap_thr
+                and sat_med < short_flat_sat_thr
+                and entropy_med < short_flat_entropy_thr
+                and edges_med < short_flat_edges_thr
+            ):
+                return ModerationResult(ok=False, reason="flat_surface_short", fingerprint=fp)
+        else:
+            if (
+                motion_med < flat_motion_thr
+                and lap_med < flat_lap_thr
+                and sat_med < flat_sat_thr
+                and entropy_med < flat_entropy_thr
+                and edges_med < flat_edges_thr
+            ):
+                return ModerationResult(ok=False, reason="flat_surface", fingerprint=fp)
+
+        return ModerationResult(ok=True, reason=None, fingerprint=fp)
+    except Exception:
+        return ModerationResult(ok=True, reason=None, fingerprint=None)
+    finally:
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
 
 def moderate_video_bytes(body: bytes, suffix: str = ".webm") -> ModerationResult:
     """
@@ -76,124 +248,11 @@ def moderate_video_bytes(body: bytes, suffix: str = ".webm") -> ModerationResult
             f.write(body)
             tmp_path = f.name
 
-        cap = cv2.VideoCapture(tmp_path)
-        if not cap.isOpened():
-            return ModerationResult(ok=True, reason=None)
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        duration_s = (frame_count / fps) if fps > 0.1 and frame_count > 0.1 else None
-
-        if duration_s is not None and duration_s < min_sec:
-            cap.release()
-            return ModerationResult(ok=False, reason="too_short")
-
-        # Собираем метрики по кадрам
-        means = []      # средняя яркость
-        stds = []       # стандартное отклонение яркости
-        laps = []       # дисперсия лапласиана (текстурность)
-        motions = []    # среднее абсолютное различие между соседними кадрами
-        sats = []       # средняя насыщенность
-        entropies = []  # энтропия
-        edges_ratio = [] # доля границ
-
-        prev_gray = None
-        decoded = 0
-        kept = 0
-
-        # Для коротких видео увеличиваем количество выборок
-        effective_max_decode = max_decode_frames
-        effective_samples = sample_frames
-        if duration_s is not None and duration_s < short_sec:
-            effective_samples = max(sample_frames, 32)
-
-        while decoded < effective_max_decode and kept < effective_samples:
-            ret, frame = cap.read()
-            decoded += 1
-            if not ret or frame is None:
-                break
-
-            # Стратегия пропуска кадров для равномерной выборки
-            stride = max(1, effective_max_decode // max(1, effective_samples))
-            if (decoded % stride) != 0:
-                continue
-
-            h, w = frame.shape[:2]
-            if h <= 0 or w <= 0:
-                continue
-
-            # Нормализуем размер для ускорения
-            target_w = 224
-            if w != target_w:
-                target_h = int(h * (target_w / w))
-                frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            mean_val = float(np.mean(gray))
-            std_val = float(np.std(gray))
-            means.append(mean_val)
-            stds.append(std_val)
-
-            # Текстурность через лапласиан
-            lap = cv2.Laplacian(gray, cv2.CV_64F)
-            laps.append(float(lap.var()))
-
-            # Насыщенность
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            sats.append(float(np.mean(hsv[:, :, 1])))
-
-            # Энтропия и доля границ
-            entropies.append(_image_entropy(gray))
-            edges_ratio.append(_edge_ratio(gray))
-
-            # Движение между кадрами
-            if prev_gray is not None:
-                diff = cv2.absdiff(gray, prev_gray)
-                motions.append(float(np.mean(diff)))
-            prev_gray = gray
-            kept += 1
-
-        cap.release()
-
-        if not means:
-            return ModerationResult(ok=True, reason=None)
-
-        # 1. Детекция чёрного экрана (тёмный + малая вариативность)
-        blackish = [(m < black_mean_thr and s < black_std_thr) for m, s in zip(means, stds)]
-        if sum(blackish) >= max(3, int(0.75 * len(blackish))):
-            return ModerationResult(ok=False, reason="black_screen")
-
-        # 2. Детекция стены/потолка (статичное, плоское, низкая насыщенность)
-        motion_med = float(np.median(motions)) if motions else 0.0
-        lap_med = float(np.median(laps)) if laps else 0.0
-        sat_med = float(np.median(sats)) if sats else 0.0
-        entropy_med = float(np.median(entropies)) if entropies else 0.0
-        edges_med = float(np.median(edges_ratio)) if edges_ratio else 0.0
-
-        is_short = duration_s is not None and duration_s < short_sec
-
-        if is_short:
-            # Для коротких видео – чуть либеральнее, но всё равно отсекаем совсем пустые
-            if (motion_med < short_flat_motion_thr and
-                lap_med < short_flat_lap_thr and
-                sat_med < short_flat_sat_thr and
-                entropy_med < short_flat_entropy_thr and
-                edges_med < short_flat_edges_thr):
-                return ModerationResult(ok=False, reason="flat_surface_short")
-        else:
-            # Обычные видео
-            if (motion_med < flat_motion_thr and
-                lap_med < flat_lap_thr and
-                sat_med < flat_sat_thr and
-                entropy_med < flat_entropy_thr and
-                edges_med < flat_edges_thr):
-                return ModerationResult(ok=False, reason="flat_surface")
-
-        return ModerationResult(ok=True, reason=None)
+        return moderate_video_path(tmp_path)
 
     except Exception:
         # Модерация не должна ломать сервис – пропускаем видео при любой ошибке
-        return ModerationResult(ok=True, reason=None)
+        return ModerationResult(ok=True, reason=None, fingerprint=None)
     finally:
         if tmp_path:
             try:
