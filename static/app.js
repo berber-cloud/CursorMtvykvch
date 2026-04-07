@@ -96,6 +96,47 @@ function setCameraControlsDisabled(disabled) {
   btnFlip.disabled = disabled;
 }
 
+async function ensureMediaReady({ showOverlayIfNeeded = true } = {}) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    if (showOverlayIfNeeded) {
+      permOverlay.hidden = false;
+      showPermError("Откройте сайт по HTTPS (или localhost), чтобы браузер разрешил камеру и микрофон.");
+      btnAllowMedia.disabled = true;
+    }
+    return false;
+  }
+
+  // Если разрешения уже выданы — стартуем камеру автоматически и не показываем плашку.
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const cam = await navigator.permissions.query({ name: "camera" });
+      const mic = await navigator.permissions.query({ name: "microphone" });
+      if (cam.state === "granted" && mic.state === "granted") {
+        await startCamera();
+        setMirror(facingMode === "user");
+        permOverlay.hidden = true;
+        setCameraControlsDisabled(false);
+        return true;
+      }
+      if (cam.state === "denied" || mic.state === "denied") {
+        if (showOverlayIfNeeded) {
+          permOverlay.hidden = false;
+          showPermError("Доступ запрещён. Разрешите камеру и микрофон в настройках сайта в браузере и нажмите снова.");
+        }
+        return false;
+      }
+      // prompt → оставляем кнопку
+    }
+  } catch (_) {
+    // Некоторые браузеры/iframe могут ломать Permissions API — просто покажем кнопку.
+  }
+
+  if (showOverlayIfNeeded) {
+    permOverlay.hidden = false;
+  }
+  return false;
+}
+
 function rememberSessionId(data) {
   const id = data && data.session_id;
   if (typeof id === "string" && /^[a-f0-9]{32}$/.test(id)) {
@@ -164,7 +205,8 @@ async function refreshStats() {
     statsLine.textContent = `Всего видео: ${total}`;
     return s;
   } catch {
-    statsLine.textContent = "";
+    // Не зависаем на "Загрузка…" навсегда.
+    statsLine.textContent = "Всего видео: —";
     return null;
   }
 }
@@ -275,8 +317,13 @@ async function uploadBlob(blob) {
     headers: { ...sessionFetchHeaders() },
   });
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || "upload failed");
+    const contentType = r.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.detail || `Ошибка отправки (${r.status})`);
+    }
+    const t = await r.text().catch(() => "");
+    throw new Error(t || `Ошибка отправки (${r.status})`);
   }
   const up = await r.json();
   rememberSessionId(up);
@@ -341,7 +388,7 @@ btnRecord.addEventListener("click", async () => {
     try {
       await uploadBlob(blob);
     } catch (e) {
-      statusLine.textContent = "Не удалось отправить видео";
+      statusLine.textContent = (e && e.message) || "Не удалось отправить видео";
       console.error(e);
     }
   };
@@ -420,12 +467,8 @@ videoEl.addEventListener("ended", () => {
   setMirror(true);
   setCameraControlsDisabled(true);
   clearPermError();
-
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    permOverlay.hidden = false;
-    showPermError("Откройте сайт по HTTPS (или localhost), чтобы браузер разрешил камеру и микрофон.");
-    btnAllowMedia.disabled = true;
-  }
+  btnAllowMedia.disabled = false;
+  await ensureMediaReady({ showOverlayIfNeeded: true });
 
   await refreshQuota();
   await refreshStats();

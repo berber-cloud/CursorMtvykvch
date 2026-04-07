@@ -182,6 +182,15 @@ def pick_random_video(exclude_owner_sid: str) -> tuple[str, str] | None:
     return None
 
 
+def list_video_paths() -> list[str]:
+    """List relative kruzhki/<id>.(webm|mp4) paths in the dataset."""
+    if not enabled():
+        return []
+    repo = _repo()
+    api = _api()
+    return _list_kruzhki_video_paths(api, repo)
+
+
 def local_path_for_playback(rel_path: str) -> Path:
     """Download (cached) file from Hub; returns local path for FileResponse."""
     safe = rel_path.lstrip("/").replace("..", "")

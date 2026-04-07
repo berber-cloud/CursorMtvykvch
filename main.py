@@ -250,6 +250,46 @@ def _sync_local_to_hub_loop() -> None:
         sleep(2)
 
 
+def _premoderate_hub_loop() -> None:
+    """
+    Фоновая модерация уже существующего датасета: постепенно помечаем спам,
+    чтобы он перестал попадать в выдачу.
+    """
+    while True:
+        try:
+            if not hub.enabled():
+                sleep(20)
+                continue
+
+            # Берём небольшой батч (чтобы не перегружать Hub).
+            paths = hub.list_video_paths()
+            if not paths:
+                sleep(20)
+                continue
+            random.shuffle(paths)
+
+            checked = 0
+            for rel in paths[:12]:
+                name = Path(rel).name
+                if _is_rejected(name):
+                    continue
+                try:
+                    local = hub.local_path_for_playback(rel)
+                    b = local.read_bytes()
+                    _moderate_or_ok(name, b, Path(name).suffix.lower() or ".webm")
+                except HTTPException:
+                    # _moderate_or_ok уже пометил как rejected
+                    pass
+                except Exception:
+                    pass
+                checked += 1
+                if checked >= 4:
+                    break
+        except Exception:
+            pass
+        sleep(4)
+
+
 def _session_state(sessions: dict, sid: str) -> dict:
     if sid not in sessions:
         sessions[sid] = {"uploads": 0, "views": 0}
@@ -271,6 +311,8 @@ app = FastAPI(title="Kruzchl")
 def _startup():
     t = Thread(target=_sync_local_to_hub_loop, daemon=True)
     t.start()
+    t2 = Thread(target=_premoderate_hub_loop, daemon=True)
+    t2.start()
 
 app.mount(
     "/static",

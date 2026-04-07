@@ -37,6 +37,11 @@ def moderate_video_bytes(body: bytes, suffix: str) -> ModerationResult:
     flat_lap_thr = _env_float("KRUZHCL_MOD_FLAT_LAPLACIAN", 18.0)
     flat_motion_thr = _env_float("KRUZHCL_MOD_FLAT_MOTION", 1.2)
     flat_sat_thr = _env_float("KRUZHCL_MOD_FLAT_SAT", 28.0)
+    short_sec = _env_float("KRUZHCL_MOD_SHORT_SECONDS", 5.0)
+    min_sec = _env_float("KRUZHCL_MOD_MIN_SECONDS", 1.0)
+    short_flat_lap_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_LAPLACIAN", 14.0)
+    short_flat_motion_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_MOTION", 2.0)
+    short_flat_sat_thr = _env_float("KRUZHCL_MOD_SHORT_FLAT_SAT", 34.0)
 
     tmp_path = None
     try:
@@ -48,6 +53,14 @@ def moderate_video_bytes(body: bytes, suffix: str) -> ModerationResult:
         if not cap.isOpened():
             return ModerationResult(ok=True)
 
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+        duration_s = (frame_count / fps) if fps > 0.1 and frame_count > 0.1 else None
+
+        if duration_s is not None and duration_s < min_sec:
+            cap.release()
+            return ModerationResult(ok=False, reason="too_short")
+
         means: list[float] = []
         stds: list[float] = []
         laps: list[float] = []
@@ -58,14 +71,21 @@ def moderate_video_bytes(body: bytes, suffix: str) -> ModerationResult:
         decoded = 0
         kept = 0
 
-        while decoded < max_decode_frames and kept < sample_frames:
+        # Для коротких видео читаем плотнее.
+        effective_max_decode = max_decode_frames
+        effective_samples = sample_frames
+        if duration_s is not None and duration_s < short_sec:
+            effective_max_decode = max_decode_frames
+            effective_samples = max(sample_frames, 28)
+
+        while decoded < effective_max_decode and kept < effective_samples:
             ok, frame = cap.read()
             decoded += 1
             if not ok or frame is None:
                 break
 
             # Берём каждый N-й кадр, чтобы быть дешевле.
-            stride = max(1, max_decode_frames // max(1, sample_frames))
+            stride = max(1, effective_max_decode // max(1, effective_samples))
             if (decoded % stride) != 0:
                 continue
 
@@ -115,8 +135,17 @@ def moderate_video_bytes(body: bytes, suffix: str) -> ModerationResult:
         lap_med = float(np.median(laps)) if laps else 0.0
         sat_med = float(np.median(sats)) if sats else 0.0
 
-        if motion_med < flat_motion_thr and lap_med < flat_lap_thr and sat_med < flat_sat_thr:
-            return ModerationResult(ok=False, reason="flat_surface")
+        if duration_s is not None and duration_s < short_sec:
+            # Для коротких видео ужесточаем: спам часто почти статичен и однотонен.
+            if (
+                motion_med < short_flat_motion_thr
+                and lap_med < short_flat_lap_thr
+                and sat_med < short_flat_sat_thr
+            ):
+                return ModerationResult(ok=False, reason="flat_surface_short")
+        else:
+            if motion_med < flat_motion_thr and lap_med < flat_lap_thr and sat_med < flat_sat_thr:
+                return ModerationResult(ok=False, reason="flat_surface")
 
         return ModerationResult(ok=True)
     except Exception:

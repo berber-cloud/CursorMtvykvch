@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="perm-overlay" id="permOverlay" role="dialog" aria-modal="true" aria-labelledby="permTitle" aria-describedby="permDesc">
+    <div class="perm-overlay" id="permOverlay" hidden role="dialog" aria-modal="true" aria-labelledby="permTitle" aria-describedby="permDesc">
       <div class="perm-card">
         <h1 class="perm-title" id="permTitle">Доступ к камере и микрофону</h1>
         <p class="perm-desc" id="permDesc">
@@ -24,7 +24,7 @@
       </header>
 
       <main class="stage">
-        <p class="hint" id="statsLine"></p>
+        <p class="hint" id="statsLine">Загрузка…</p>
         <div class="circle-wrap" id="circleWrap">
           <svg class="record-ring-svg" viewBox="0 0 100 100" aria-hidden="true">
             <circle class="record-ring-track" cx="50" cy="50" r="46.75" pathLength="100" />
